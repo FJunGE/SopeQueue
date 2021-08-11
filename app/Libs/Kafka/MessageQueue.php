@@ -4,6 +4,9 @@ namespace App\Libs\Kafka;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use RdKafka\Conf;
+use RdKafka\Consumer;
+use RdKafka\KafkaConsumer;
+use RdKafka\KafkaErrorException;
 use RdKafka\Message;
 use RdKafka\Producer;
 
@@ -18,25 +21,9 @@ class MessageQueue
         $this->conf->set('metadata.broker.list', '127.0.0.1:9092');
         $this->conf->set('log_level', (string)LOG_DEBUG);
         $this->conf->set('debug', 'all');
-        $this->conf->set('acks', 'all');
 
-        // 	Alias for message.send.max.retries: How many times to retry sending a failing Message.
-        // Note: retrying may cause reordering unless enable.idempotence is set to true.
-        // 消息重发次数，enable.idempotence为true 顺序不会打乱
-        $this->conf->set('message.send.max.retries', 3);
-
-        // Client group session and failure detection timeout.
-        // The consumer sends periodic heartbeats (heartbeat.interval.ms) to indicate its liveness to the broker.
-        // 客户端组会话故障超时时间，心跳信号，超过当前时间，消费哲组重平衡
-        $this->conf->set('session.timeout.ms', 15000);
-
-        // Default timeout for network requests.
-        // 网络请求的默认超时。
-        $this->conf->set('socket.timeout.ms', 15000);
-
-        //	When set to true, the producer will ensure that messages are successfully produced exactly once and in the original produce order.
-        // 当设置为true时，producer将确保消息只成功生成一次，并且以原始的生成顺序生成。
-        $this->conf->set('enable.idempotence', true);
+        // 加载kafka配置
+        $this->config('broker');
 
         // 发送失败回调
         $this->conf->setErrorCb(function ($kafka, $err, $reason) {
@@ -46,7 +33,7 @@ class MessageQueue
 
     }
 
-    public function producer($topic, $message)
+    public function producer($topic, $message, $beginTransaction = false)
     {
         // 发送成功回调
         $this->conf->setDrMsgCb(function ($kafka, Message $message){
@@ -54,11 +41,32 @@ class MessageQueue
                 ->info("success, reason: {$message->errstr()}, time: ", now()->toDateTimeString());
         });
 
+        $this->config('producer');
         $producer = new Producer($this->conf);
 
-        $topic = $producer->newTopic($topic);
+        $rdTopic = $producer->newTopic($topic);
 
-        $topic->produce(RD_KAFKA_PARTITION_UA, 0, $message);
+        $message = serialize($message);
+
+        if ($beginTransaction) {
+            // 开启事务 设置事务id
+            $this->conf->set('transaction.id', $topic.'__transaction');
+            $producer->initTransactions(30000);
+            try {
+                $producer->beginTransaction();
+                $topic->produce(RD_KAFKA_PARTITION_UA, 0, $message);
+                $producer->commitTransaction(60000);
+
+            } catch(KafkaErrorException $exception) {
+                $producer->abortTransaction(120000);
+                Log::channel('kafka_message_queue')
+                    ->error($topic.'__transaction' . ':' . $exception->getMessage());
+            }
+        }else{
+            // 最好是自动commit
+            $rdTopic->produce(RD_KAFKA_PARTITION_UA, 0, $message);
+        }
+
 
         // 两端客户时间记录 端到端
         return $producer->flush(1000);
@@ -66,7 +74,53 @@ class MessageQueue
 
     public function consumer($topic, $autoCommit = true)
     {
+        // rebalance重平衡回调
+        $this->conf->setRebalanceCb(function (KafkaConsumer $consumer, $err, $partitions = null) {
+                switch ($err) {
+                    case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
+                        $consumer->assign($partitions);
+                        Log::channel('kafka_message_queue')
+                            ->info("Trigger Rebalance Assign Partition" . implode(",", $partitions));
+                        break;
+                    case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
+                        $consumer->assign(null);
+                        Log::channel('kafka_message_queue')
+                            ->info("Trigger Rebalance Revoke Partition" . implode(",", $partitions));
+                }
+        });
 
+        $this->conf->set('group.id', $topic.'-group');
+
+        // 设置自动提交级别
+        if ($autoCommit) {
+            $this->conf->set('enable.auto.commit', true);
+        }else{
+            $this->conf->set('enable.auto.commit', false);
+            // 避免消费时间过长导致重平衡设置
+            // 设置时间为5分钟 给下游业务争取时间
+            $this->conf->set('max.poll.interval.ms', '300000');
+        }
+
+        $this->config('consumer');
+        $consumer = new KafkaConsumer($this->conf);
+
+        $consumer->subscribe([$topic]);
+        $message = $consumer->consume(2000);
+
+        if ($message->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+            $message->payload = unserialize($message->payload);
+        }
+
+        return $message;
+    }
+
+    public function config($key)
+    {
+        $config = config("kafka.{$key}");
+
+        foreach ($config as $key => $value) {
+            $this->conf->set(str_replace('-', '.', $key), $value);
+        }
     }
 
 }
